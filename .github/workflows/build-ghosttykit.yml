@@ -2,13 +2,19 @@ name: Build GhosttyKit
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish a GitHub release after building
+        required: true
+        default: false
+        type: boolean
 
 jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -17,8 +23,39 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Verify sanitized Wuffs vendor
+        run: |
+          test -f pkg/wuffs/vendor/wuffs/release/c/wuffs-v0.4.c
+          test "$(find pkg/wuffs/vendor/wuffs -type f | wc -l | tr -d ' ')" = "3"
+          ! find pkg/wuffs/vendor/wuffs \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -path '*/test/*' -o -iname '*hippopotamus*' -o -iname '*bad-comment-length*' \) | grep .
+
       - name: Build xcframework
-        run: zig build -Doptimize=ReleaseFast -Demit-xcframework=true -Dxcframework-target=universal -Demit-macos-app=false
+        run: zig build -Doptimize=ReleaseFast -Demit-xcframework=true -Dxcframework-target=universal -Demit-macos-app=false -Dversion-string=1.3.2-dev
+
+      - name: Verify archive members
+        run: |
+          lipo macos/GhosttyKit.xcframework/macos-arm64_x86_64/ghostty-internal.a -thin arm64 -output /tmp/ghostty-arm64.a
+          lipo macos/GhosttyKit.xcframework/macos-arm64_x86_64/ghostty-internal.a -thin x86_64 -output /tmp/ghostty-x86_64.a
+
+          for archive in \
+            /tmp/ghostty-arm64.a \
+            /tmp/ghostty-x86_64.a \
+            macos/GhosttyKit.xcframework/ios-arm64/libghostty-internal-fat.a \
+            macos/GhosttyKit.xcframework/ios-arm64-simulator/libghostty-internal-fat.a
+          do
+            echo "$archive"
+            duplicates="$(/usr/bin/ar -t "$archive" | sort | uniq -d)"
+            if [ -n "$duplicates" ]; then
+              echo "$duplicates"
+              exit 1
+            fi
+          done
+
+      - name: Verify expected symbols
+        run: |
+          nm -A /tmp/ghostty-arm64.a | grep '_ImFontConfig_ImFontConfig'
+          nm -A /tmp/ghostty-arm64.a | grep '_ImGuiStyle_ImGuiStyle'
+          nm -A /tmp/ghostty-arm64.a | grep '_zig_cabi_CTLineGetBoundsWithOptions'
 
       - name: Compress xcframework
         run: |
@@ -32,6 +69,29 @@ jobs:
           cp -R zig-out/share/ghostty/themes resources-stage/ghostty/
           cp -R zig-out/share/terminfo resources-stage/
           tar czf GhosttyKit-resources.tar.gz -C resources-stage ghostty terminfo
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: GhosttyKit-safe
+          path: |
+            macos/GhosttyKit.xcframework.tar.gz
+            GhosttyKit-resources.tar.gz
+
+  release:
+    if: ${{ inputs.publish_release }}
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: GhosttyKit-safe
+          path: release-artifacts
 
       - name: Create release
         env:
@@ -50,5 +110,5 @@ jobs:
             --title "GhosttyKit $(date -u +%Y-%m-%d)" \
             --latest \
             --notes "Built from commit ${COMMIT} on $(date -u +%Y-%m-%d)" \
-            macos/GhosttyKit.xcframework.tar.gz \
-            GhosttyKit-resources.tar.gz
+            release-artifacts/GhosttyKit.xcframework.tar.gz \
+            release-artifacts/GhosttyKit-resources.tar.gz
